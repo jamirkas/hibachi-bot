@@ -1,0 +1,29 @@
+# Hibachi Bot — Example Configuration
+# Copy to config.yaml and fill in your keys.
+
+api_key: "YOUR_API_KEY"
+secret_key: "YOUR_SECRET_KEY"
+account_id: 0
+
+risk:
+  max_position_size: 5000.0     # USDT
+  max_total_exposure: 10000.0   # USDT
+  stop_loss_pct: 0.05           # 5%
+  max_grid_levels: 20
+  min_order_size: 10.0
+  max_open_orders: 50
+
+strategies:
+  - name: grid
+    symbol: "BTC/USDT-P"
+    enabled: true
+    grid_levels: 10
+    grid_spread_pct: 0.1
+    grid_base_qty: "0.001"
+
+  - name: mm
+    symbol: "BTC/USDT-P"
+    enabled: true
+    mm_spread: 0.05
+    mm_order_qty: "0.001"
+    mm_refresh_sec: 2.0
