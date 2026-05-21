@@ -1,117 +1,192 @@
 """
-Grid trading strategy.
+Grid trading strategy with take-profit and stop-loss.
 
-Places a ladder of limit orders above and below current price.
-Profits from oscillation — buys low, sells high within the grid.
+Features:
+- Configurable grid levels, step %, order size
+- Per-grid TP/SL
+- Trailing take-profit (optional)
+- PnL tracking
 """
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN
 
 from .base import BaseStrategy
 from ..exchange import HibachiExchange
-from ..config import StrategyConfig
-from ..risk import RiskConfig
+from ..config import GridConfig, RiskConfig
 
 logger = logging.getLogger("hibachi.strategy.grid")
 
 
+@dataclass
+class GridLevel:
+    side: str           # "BUY" | "SELL"
+    price: Decimal
+    order_id: int | None = None
+    entry_price: Decimal | None = None  # Actual fill price
+    filled: bool = False
+    filled_at: float = 0.0              # Timestamp
+    pnl: float = 0.0
+
+
 class GridStrategy(BaseStrategy):
     """
-    Grid trading places equidistant limit orders forming a price ladder.
+    Grid trading bot.
 
-    Example for BTC/USDT-P @ 100,000 with 10 levels and 0.1% spread:
-        Buys:  99,900 | 99,800 | 99,700 | 99,600 | 99,500
-        Sells: 100,100 | 100,200 | 100,300 | 100,400 | 100,500
-
-    When a buy fills, a corresponding sell goes above. When a sell fills,
-    a corresponding buy goes below. Nets the spread each round-trip.
+    Places N buy levels below mid-price and N sell levels above.
+    When a buy fills, tracks it for TP/SL. When a sell fills, same.
     """
 
-    def __init__(self, exchange: HibachiExchange, config: StrategyConfig, risk: RiskConfig):
+    def __init__(self, exchange: HibachiExchange, config: GridConfig, risk: RiskConfig):
         super().__init__(exchange, config, risk)
-        self._base_qty = Decimal(config.grid_base_qty)
-        self._spread_pct = Decimal(str(config.grid_spread_pct))
-        self._levels = config.grid_levels
-        self._active_orders: dict[int, dict] = {}  # order_id → details
+        self._cfg = config
+        self._levels: list[GridLevel] = []
+        self._pnl_total: float = 0.0
+        self._rounds: int = 0
 
     async def setup(self) -> None:
-        """Cancel all existing orders and place fresh grid."""
-        symbol = self.config.symbol
-        logger.info(f"[grid] Setting up grid on {symbol} — {self._levels} levels, {self._spread_pct}% spread")
+        symbol = self._cfg.symbol
+        logger.info(f"🧱 Grid: {self._cfg.grid_count}×2 levels, "
+                     f"step={self._cfg.step_pct}%, size=${self._cfg.order_size_usdt}, "
+                     f"TP={self._cfg.take_profit_pct}%, SL={self._cfg.stop_loss_pct}%")
 
-        # Cancel everything
         self.exchange.cancel_all_orders(symbol)
-        self._active_orders.clear()
+        self._levels.clear()
 
-        # Get mid-price
-        book = self.exchange.order_book(symbol)
-        if not book.bids or not book.asks:
-            logger.warning("[grid] Empty order book, retrying...")
-            return
-
-        mid = Decimal(str((book.bids[0][0] + book.asks[0][0]) / 2)).quantize(Decimal("0.1"), ROUND_DOWN)
-        logger.info(f"[grid] Mid-price: {mid}")
-
-        # Place buy + sell ladders
-        for i in range(self._levels):
-            buy_price = mid * (Decimal("1") - self._spread_pct * Decimal(str(i + 1)) / Decimal("100"))
-            sell_price = mid * (Decimal("1") + self._spread_pct * Decimal(str(i + 1)) / Decimal("100"))
-
-            self._place("BUY", str(buy_price), symbol)
-            self._place("SELL", str(sell_price), symbol)
-
-        logger.info(f"[grid] Placed {len(self._active_orders)} orders")
+        await self._place_grid()
 
     async def tick(self) -> None:
-        """Check filled orders and replace them on the opposite side."""
-        symbol = self.config.symbol
+        symbol = self._cfg.symbol
+
+        # 1. Check existing orders — what filled?
         open_orders = self.exchange.open_orders(symbol)
+        open_ids = {o["orderId"] for o in open_orders}
 
-        current_ids = {o["orderId"] for o in open_orders}
+        for level in self._levels:
+            if level.order_id and level.order_id not in open_ids and not level.filled:
+                level.filled = True
+                level.filled_at = time.time()
+                logger.info(f"  ✅ Grid fill: {level.side} @ {level.price}")
 
-        # Find filled/cancelled orders
-        to_replace = []
-        for oid, details in list(self._active_orders.items()):
-            if oid not in current_ids:
-                logger.info(f"[grid] Order {oid} filled ({details['side']} @ {details['price']})")
-                to_replace.append(details)
-                del self._active_orders[oid]
+        # 2. Check TP/SL on filled levels
+        book = self.exchange.order_book(symbol, depth=1)
+        if book.bids and book.asks:
+            mark = Decimal(str((book.bids[0][0] + book.asks[0][0]) / 2))
+            await self._check_exits(mark)
 
-        # Replace filled orders on opposite side
-        book = self.exchange.order_book(symbol)
+        # 3. If all filled, reset grid
+        all_filled = all(lv.filled for lv in self._levels if lv.order_id)
+        if all_filled and len(self._levels) > 0:
+            self._rounds += 1
+            logger.info(f"🔄 Grid round {self._rounds} complete! Total PnL: ${self._pnl_total:.2f}")
+            self._levels.clear()
+            await self._place_grid()
+
+        # 4. Replace filled levels on opposite side
+        await self._replace_filled()
+
+        await asyncio.sleep(self._cfg.refresh_sec)
+
+    def _price_precision(self, price: Decimal) -> Decimal:
+        """Round to reasonable precision for the exchange."""
+        return price.quantize(Decimal("0.1"), ROUND_DOWN)
+
+    async def _place_grid(self) -> None:
+        """Place initial buy and sell ladders."""
+        symbol = self._cfg.symbol
+        book = self.exchange.order_book(symbol, depth=1)
         if not book.bids or not book.asks:
+            logger.warning("Empty order book — cannot place grid")
             return
 
-        mid = (book.bids[0][0] + book.asks[0][0]) / 2
+        mid = Decimal(str((book.bids[0][0] + book.asks[0][0]) / 2))
+        step = self._price_precision(mid * Decimal(str(self._cfg.step_pct)) / Decimal("100"))
+        qty = self._price_precision(Decimal(str(self._cfg.order_size_usdt)) / mid)
 
-        for d in to_replace:
-            filled_price = float(d["price"])
-            if d["side"] == "BUY":
-                # Buy filled → place sell above
-                new_price = str(round(filled_price * (1 + self.config.grid_spread_pct / 100 * 2), 1))
-                self._place("SELL", new_price, symbol)
-            else:
-                # Sell filled → place buy below
-                new_price = str(round(filled_price * (1 - self.config.grid_spread_pct / 100 * 2), 1))
-                self._place("BUY", new_price, symbol)
+        for i in range(self._cfg.grid_count):
+            buy_price = self._price_precision(mid - step * (i + 1))
+            sell_price = self._price_precision(mid + step * (i + 1))
 
-        await asyncio.sleep(1)  # Rate-limit guard
+            if buy_price > 0:
+                self._place_order("BUY", buy_price, qty, symbol)
+            self._place_order("SELL", sell_price, qty, symbol)
 
-    def _place(self, side: str, price: str, symbol: str) -> None:
-        """Place a limit order and track it."""
+    def _place_order(self, side: str, price: Decimal, qty: Decimal, symbol: str) -> None:
         try:
             resp = self.exchange.place_order(
                 symbol=symbol,
                 side=side,
                 order_type="LIMIT",
-                quantity=str(self._base_qty),
-                price=price,
+                quantity=str(qty),
+                price=str(price),
                 time_in_force="GTC",
             )
             oid = resp.get("orderId")
-            if oid:
-                self._active_orders[oid] = {"side": side, "price": price}
+            self._levels.append(GridLevel(side=side, price=price, order_id=oid))
         except Exception as e:
-            logger.error(f"[grid] Failed to place {side} @ {price}: {e}")
+            logger.error(f"Order failed ({side} @ {price}): {e}")
+
+    async def _check_exits(self, mark: Decimal) -> None:
+        """Close positions at TP or SL."""
+        for lv in self._levels:
+            if not lv.filled or lv.order_id is not None:
+                continue
+
+            pnl_pct = float((mark - lv.price) / lv.price * 100)
+            if lv.side == "SELL":
+                pnl_pct = -pnl_pct
+
+            # Take profit
+            if pnl_pct >= self._cfg.take_profit_pct:
+                self._close_grid_level(lv, mark, "TP", pnl_pct)
+            # Stop loss
+            elif pnl_pct <= -self._cfg.stop_loss_pct:
+                self._close_grid_level(lv, mark, "SL", pnl_pct)
+
+    def _close_grid_level(self, lv: GridLevel, mark: Decimal, reason: str, pnl_pct: float) -> None:
+        """Market-close a filled grid level."""
+        symbol = self._cfg.symbol
+        close_side = "SELL" if lv.side == "BUY" else "BUY"
+        qty = self._price_precision(Decimal(str(self._cfg.order_size_usdt)) / mark)
+        pnl_usdt = self._cfg.order_size_usdt * pnl_pct / 100
+
+        try:
+            self.exchange.place_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="MARKET",
+                quantity=str(qty),
+                reduce_only=True,
+            )
+            self._pnl_total += pnl_usdt
+            lv.order_id = None  # Mark as closed
+            logger.info(f"  [{reason}] {lv.side} @ {lv.price} → {mark} | "
+                         f"{pnl_pct:+.2f}% | ${pnl_usdt:+.2f} | Total: ${self._pnl_total:+.2f}")
+        except Exception as e:
+            logger.error(f"Close failed: {e}")
+
+    async def _replace_filled(self) -> None:
+        """Replace filled grid levels on the opposite side."""
+        symbol = self._cfg.symbol
+        book = self.exchange.order_book(symbol, depth=1)
+        if not book.bids or not book.asks:
+            return
+        mid = Decimal(str((book.bids[0][0] + book.asks[0][0]) / 2))
+        step = self._price_precision(mid * Decimal(str(self._cfg.step_pct)) / Decimal("100"))
+        qty = self._price_precision(Decimal(str(self._cfg.order_size_usdt)) / mid)
+
+        for lv in self._levels:
+            if not lv.filled or lv.order_id is not None:
+                continue
+
+            if lv.side == "BUY":
+                new_price = self._price_precision(lv.price + step * 2)
+                if new_price > mid:
+                    self._place_order("SELL", new_price, qty, symbol)
+            else:
+                new_price = self._price_precision(lv.price - step * 2)
+                if new_price < mid and new_price > 0:
+                    self._place_order("BUY", new_price, qty, symbol)

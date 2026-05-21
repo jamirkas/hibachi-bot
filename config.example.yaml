@@ -1,29 +1,78 @@
-# Hibachi Bot — Example Configuration
-# Copy to config.yaml and fill in your keys.
+# Hibachi Trading Bot — Configuration
 
-api_key: "YOUR_API_KEY"
-secret_key: "YOUR_SECRET_KEY"
+# ============================================================
+# API Keys (REQUIRED)
+# ============================================================
+api_key: ""
+secret_key: ""
 account_id: 0
 
+# ============================================================
+# Global Risk Settings
+# ============================================================
 risk:
-  max_position_size: 5000.0     # USDT
-  max_total_exposure: 10000.0   # USDT
-  stop_loss_pct: 0.05           # 5%
-  max_grid_levels: 20
-  min_order_size: 10.0
-  max_open_orders: 50
+  max_total_exposure: 5000.0     # Maximum USDT at risk
+  max_position_per_side: 1000.0  # Max USDT per buy or sell side
+  
+# ============================================================
+# Strategy: Select ONE or BOTH
+# ============================================================
+active_strategies:
+  - grid
+  # - mm
 
-strategies:
-  - name: grid
-    symbol: "BTC/USDT-P"
-    enabled: true
-    grid_levels: 10
-    grid_spread_pct: 0.1
-    grid_base_qty: "0.001"
+# ============================================================
+# Grid Strategy Settings
+# ============================================================
+grid:
+  symbol: "BTC/USDT-P"           # Trading pair
+  enabled: true
+  
+  # Grid parameters
+  grid_count: 10                 # Number of buy AND sell levels (20 total)
+  step_pct: 0.15                 # Distance between grid levels (%)
+  order_size_usdt: 50.0          # USDT value per grid order
+  
+  # Profit & Risk
+  take_profit_pct: 0.3           # Close position at +0.3% profit
+  stop_loss_pct: 2.0             # Close position at -2.0% loss
+  trailing_tp: false             # Move TP with price
+  
+  # Execution
+  refresh_sec: 5.0               # How often to check & adjust grid
+  
+# ============================================================
+# Market Maker Strategy Settings  
+# ============================================================
+mm:
+  symbol: "BTC/USDT-P"
+  enabled: true
+  
+  # Spread
+  spread_pct: 0.05               # Bid/Ask distance from mid-price (%)
+  min_spread_pct: 0.02           # Narrowest allowed spread
+  max_spread_pct: 0.2            # Widest allowed spread
+  
+  # Order sizing
+  order_size_usdt: 100.0         # USDT value per order
+  max_orders_per_side: 3         # Max bid/ask levels
+  
+  # Position limits
+  max_long_usdt: 500.0           # Max long exposure
+  max_short_usdt: 500.0          # Max short exposure
+  
+  # Safety
+  cancel_on_price_move_pct: 1.0  # Cancel orders if price moves >1%
+  refresh_sec: 2.0               # Order refresh interval
+  
+  # Auto-adjust spread based on volatility
+  adaptive_spread: true
 
-  - name: mm
-    symbol: "BTC/USDT-P"
-    enabled: true
-    mm_spread: 0.05
-    mm_order_qty: "0.001"
-    mm_refresh_sec: 2.0
+# ============================================================
+# Display & Logging
+# ============================================================
+display:
+  console_log: true               # Print trades to console
+  save_log: true                  # Save to hibachi-bot.log
+  web_dashboard: false            # Start web UI on port 8080
+  web_port: 8080
