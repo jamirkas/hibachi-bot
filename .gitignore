@@ -3,6 +3,7 @@ __pycache__/
 .env
 config.yaml
 *.log
+*.jsonl
 .venv/
 venv/
 dist/
