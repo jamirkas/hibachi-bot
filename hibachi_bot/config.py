@@ -1,12 +1,26 @@
 """
 Configuration loader with validation.
+
+Secrets are loaded from environment variables FIRST, with config.yaml
+as a fallback for backward compatibility.
+
+Environment variables:
+  HIBACHI_API_KEY       — API key (REQUIRED)
+  HIBACHI_SECRET_KEY    — Secret key (REQUIRED)
+  HIBACHI_ACCOUNT_ID    — Account ID (REQUIRED)
+  DASHBOARD_PORT        — Web dashboard port (default: 8080)
+  DASHBOARD_TOKEN       — Dashboard access token (default: none = open)
+  DASHBOARD_HOST        — Dashboard bind address (default: 127.0.0.1)
+  BINANCE_ORACLE_ENABLED — Enable Binance WS fair price (default: 0)
 """
 
 import os
 import yaml
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger("hibachi.config")
 
@@ -44,6 +58,11 @@ class MMConfig:
     cancel_on_price_move_pct: float = 1.0
     refresh_sec: float = 2.0
     adaptive_spread: bool = True
+    # Close Mode (from zo-market-maker-ts): when exposure > threshold, only open
+    # one side to reduce risk.
+    close_mode_enabled: bool = True
+    close_mode_threshold_usd: float = 300.0
+    close_mode_tight_spread: float = 0.03
 
 
 @dataclass
@@ -52,6 +71,8 @@ class DisplayConfig:
     save_log: bool = True
     web_dashboard: bool = False
     web_port: int = 8080
+    web_host: str = "127.0.0.1"
+    web_token: str = ""
 
 
 @dataclass
@@ -67,31 +88,47 @@ class BotConfig:
 
     @classmethod
     def from_file(cls, path: str) -> "BotConfig":
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Config not found: {path}")
+        """Load config from YAML, with env vars as primary source for secrets."""
+        data = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
 
-        with open(path) as f:
-            data = yaml.safe_load(f)
+        # Secrets: env vars FIRST, config.yaml as fallback
+        api_key = os.getenv("HIBACHI_API_KEY") or data.get("api_key", "")
+        secret_key = os.getenv("HIBACHI_SECRET_KEY") or data.get("secret_key", "")
+        account_id = int(os.getenv("HIBACHI_ACCOUNT_ID") or data.get("account_id", 0))
+
+        # Dashboard: env vars override config
+        display_data = data.get("display", {})
+        display = DisplayConfig(
+            console_log=display_data.get("console_log", True),
+            save_log=display_data.get("save_log", True),
+            web_dashboard=display_data.get("web_dashboard", False),
+            web_port=int(os.getenv("DASHBOARD_PORT") or display_data.get("web_port", 8080)),
+            web_host=os.getenv("DASHBOARD_HOST") or display_data.get("web_host", "127.0.0.1"),
+            web_token=os.getenv("DASHBOARD_TOKEN") or display_data.get("web_token", ""),
+        )
 
         return cls(
-            api_key=data.get("api_key", os.getenv("HIBACHI_API_KEY", "")),
-            secret_key=data.get("secret_key", os.getenv("HIBACHI_SECRET_KEY", "")),
-            account_id=data.get("account_id", int(os.getenv("HIBACHI_ACCOUNT_ID", "0"))),
+            api_key=api_key,
+            secret_key=secret_key,
+            account_id=account_id,
             risk=RiskConfig(**data.get("risk", {})),
             active_strategies=data.get("active_strategies", ["grid"]),
             grid=GridConfig(**data.get("grid", {})),
             mm=MMConfig(**data.get("mm", {})),
-            display=DisplayConfig(**data.get("display", {})),
+            display=display,
         )
 
     def validate(self) -> list[str]:
         errors = []
         if not self.api_key:
-            errors.append("api_key is required")
+            errors.append("api_key is required (set HIBACHI_API_KEY in .env)")
         if not self.secret_key:
-            errors.append("secret_key is required")
+            errors.append("secret_key is required (set HIBACHI_SECRET_KEY in .env)")
         if not self.account_id:
-            errors.append("account_id is required (find in Hibachi API settings)")
+            errors.append("account_id is required (set HIBACHI_ACCOUNT_ID in .env)")
         if not self.active_strategies:
             errors.append("active_strategies cannot be empty")
         return errors

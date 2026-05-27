@@ -1,6 +1,11 @@
 """
 Web dashboard for real-time bot monitoring.
 
+Security:
+  - Binds to 127.0.0.1 by default (set DASHBOARD_HOST=0.0.0.0 for remote)
+  - Optional token auth via DASHBOARD_TOKEN env var
+  - Token is checked via ?token= query param or X-Dashboard-Token header
+
 Usage:
     python dashboard.py           # Standalone
     python main.py                # With display.web_dashboard: true
@@ -9,15 +14,15 @@ Usage:
 import asyncio
 import json
 import logging
+import os
 import time
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
@@ -51,6 +56,7 @@ class BotState:
     strategies: list[str] = field(default_factory=list)
     symbol: str = "BTC/USDT-P"
     mark_price: float = 0.0
+    oracle_price: float = 0.0
     started_at: float = 0.0
 
     def add_event(self, event_type: str, detail: str, pnl: float = 0.0):
@@ -97,13 +103,29 @@ class BotState:
             "strategies": self.strategies,
             "symbol": self.symbol,
             "mark_price": self.mark_price,
+            "oracle_price": self.oracle_price,
             "pnl_history": self.pnl_history,
         }
 
 
+# ── Auth middleware ──────────────────────────────────
+
+EXPECTED_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
+
+
+async def verify_token(request: Request):
+    """Reject requests if DASHBOARD_TOKEN is set and not provided."""
+    if not EXPECTED_TOKEN:
+        return  # No token required
+    # Check query param first, then header
+    token = request.query_params.get("token") or request.headers.get("X-Dashboard-Token")
+    if token != EXPECTED_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing dashboard token")
+
+
 # ── FastAPI App ──────────────────────────────────────
 
-TEMPLATE_DIR = Path(__file__).parent / "templates"
+TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
 
 app = FastAPI(title="Hibachi Bot Dashboard", docs_url=None, redoc_url=None)
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
@@ -112,24 +134,30 @@ templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 _state: Optional[BotState] = None
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(verify_token)])
 async def index(request: Request):
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
-@app.get("/api/state")
+@app.get("/api/state", dependencies=[Depends(verify_token)])
 async def api_state():
     if _state is None:
         return JSONResponse({"error": "Bot not started"}, status_code=503)
     return JSONResponse(_state.to_dict())
 
 
-def create_dashboard(state: BotState, port: int = 8080):
-    """Start dashboard server in background thread."""
+def create_dashboard(state: BotState, port: int = 8080, host: str = "127.0.0.1"):
+    """Start dashboard server in background thread.
+
+    Args:
+        state: Shared BotState for real-time data
+        port: TCP port (default from DASHBOARD_PORT env or 8080)
+        host: Bind address (default from DASHBOARD_HOST env or 127.0.0.1)
+    """
     global _state
     _state = state
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
 
     def run():
@@ -137,5 +165,7 @@ def create_dashboard(state: BotState, port: int = 8080):
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    logger.info(f"📊 Dashboard: http://localhost:{port}")
+
+    auth_msg = "🔒 token required" if EXPECTED_TOKEN else "⚠️  no auth"
+    logger.info(f"📊 Dashboard: http://{host}:{port} ({auth_msg})")
     return thread

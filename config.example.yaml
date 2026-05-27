@@ -1,11 +1,10 @@
-# Hibachi Trading Bot — Configuration
-
-# ============================================================
-# API Keys (REQUIRED)
-# ============================================================
-api_key: ""
-secret_key: ""
-account_id: 0
+# Hibachi Trading Bot — Configuration (Trading Parameters Only)
+# 
+# API keys are stored in .env (see .env.example):
+#   HIBACHI_API_KEY, HIBACHI_SECRET_KEY, HIBACHI_ACCOUNT_ID
+#
+# Copy to config.yaml and customize:
+#   cp config.example.yaml config.yaml
 
 # ============================================================
 # Global Risk Settings
@@ -68,11 +67,18 @@ mm:
   # Auto-adjust spread based on volatility
   adaptive_spread: true
 
+  # Close Mode: when exposure > threshold, only open the reducing side
+  close_mode_enabled: true
+  close_mode_threshold_usd: 300.0
+  close_mode_tight_spread: 0.03
+
 # ============================================================
 # Display & Logging
 # ============================================================
 display:
   console_log: true               # Print trades to console
   save_log: true                  # Save to hibachi-bot.log
-  web_dashboard: false            # Start web UI on port 8080
+  web_dashboard: false            # Start web UI
   web_port: 8080
+  web_host: "127.0.0.1"          # Bind to localhost (security)
+  web_token: ""                   # Optional: set DASHBOARD_TOKEN in .env

@@ -1,11 +1,15 @@
 """
-Market making strategy with adaptive spread.
+Market making strategy with adaptive spread and Close Mode.
 
 Features:
 - Configurable spread width, order count, size
 - Position limits (long/short exposure caps)
 - Auto-cancel on sharp price moves
 - Adaptive spread: widen when volatile, tighten when calm
+- Close Mode (from zo-market-maker-ts): when exposure > threshold,
+  only place reducing-side orders with tighter spread to unwind safely
+
+Inspired by: https://github.com/yat1ma30/zo-market-maker-ts
 """
 
 import asyncio
@@ -26,6 +30,10 @@ class MarketMakingStrategy(BaseStrategy):
     Market maker — maintains bid/ask orders around mid-price.
 
     With Hibachi's 0% maker fee, every round-trip is pure spread profit.
+
+    Close Mode: When long exposure > close_mode_threshold_usd, only place SELL
+    orders (reducing). When short exposure > threshold, only place BUY orders.
+    This mimics zo-market-maker-ts's dynamic close behaviour.
     """
 
     def __init__(self, exchange: HibachiExchange, config: MMConfig, risk: RiskConfig):
@@ -38,12 +46,16 @@ class MarketMakingStrategy(BaseStrategy):
         self._short_exposure: float = 0.0
         self._pnl_total: float = 0.0
         self._last_volatility: float = 0.0
+        self._close_mode_active: bool = False
 
     async def setup(self) -> None:
         symbol = self._cfg.symbol
+        close_mode = "ON" if self._cfg.close_mode_enabled else "OFF"
         logger.info(f"📊 MM: spread={self._cfg.spread_pct}%, "
                      f"order=${self._cfg.order_size_usdt}, "
-                     f"maxLong=${self._cfg.max_long_usdt}, maxShort=${self._cfg.max_short_usdt}")
+                     f"maxLong=${self._cfg.max_long_usdt}, maxShort=${self._cfg.max_short_usdt}, "
+                     f"closeMode={close_mode} "
+                     f"(threshold=${self._cfg.close_mode_threshold_usd})")
 
         self.exchange.cancel_all_orders(symbol)
         self._update_exposure()
@@ -90,15 +102,53 @@ class MarketMakingStrategy(BaseStrategy):
         # Update exposure from positions
         self._update_exposure()
 
+        # ── Close Mode ──
+        # When exposure exceeds threshold, only place orders on the reducing side
+        # with tighter spread to unwind safely.
+        place_bids = True
+        place_asks = True
+        effective_spread = spread_pct
+
+        if self._cfg.close_mode_enabled:
+            long_over = self._long_exposure > self._cfg.close_mode_threshold_usd
+            short_over = self._short_exposure > self._cfg.close_mode_threshold_usd
+
+            if long_over and not short_over:
+                place_bids = False  # Don't buy more — only sell to reduce long
+                effective_spread = self._cfg.close_mode_tight_spread
+                if not self._close_mode_active:
+                    logger.info(f"🟠 Close Mode: Long=${self._long_exposure:.0f} > "
+                                f"${self._cfg.close_mode_threshold_usd:.0f} — selling only")
+                    self._close_mode_active = True
+            elif short_over and not long_over:
+                place_asks = False  # Don't sell more — only buy to reduce short
+                effective_spread = self._cfg.close_mode_tight_spread
+                if not self._close_mode_active:
+                    logger.info(f"🟠 Close Mode: Short=${self._short_exposure:.0f} > "
+                                f"${self._cfg.close_mode_threshold_usd:.0f} — buying only")
+                    self._close_mode_active = True
+            elif long_over and short_over:
+                # Both sides over threshold (unlikely but handle gracefully)
+                place_bids = False
+                place_asks = False
+                logger.warning(f"⚠️ Both long (${self._long_exposure:.0f}) and "
+                               f"short (${self._short_exposure:.0f}) exceed threshold — pausing")
+                await asyncio.sleep(self._cfg.refresh_sec)
+                return
+            else:
+                if self._close_mode_active:
+                    logger.info(f"🟢 Close Mode: exposure normalized — full MM resumed")
+                    self._close_mode_active = False
+
         # Place bid/ask ladder
         qty = Decimal(str(self._cfg.order_size_usdt)) / mid
         qty = qty.quantize(Decimal("0.0001"), ROUND_DOWN)
 
-        half_spread = Decimal(str(spread_pct)) / Decimal("200")
+        half_spread = Decimal(str(effective_spread)) / Decimal("200")
 
         for i in range(self._cfg.max_orders_per_side):
             # Bids (buy) below mid
-            if self._long_exposure < self._cfg.max_long_usdt:
+            if place_bids and self._long_exposure < self._cfg.max_long_usdt:
                 bid_price = mid * (Decimal("1") - half_spread * (i + 1))
                 bid_price = bid_price.quantize(Decimal("0.1"), ROUND_DOWN)
                 if bid_price < best_ask:
@@ -107,7 +157,7 @@ class MarketMakingStrategy(BaseStrategy):
                         self._active_bids.append(oid)
 
             # Asks (sell) above mid
-            if self._short_exposure < self._cfg.max_short_usdt:
+            if place_asks and self._short_exposure < self._cfg.max_short_usdt:
                 ask_price = mid * (Decimal("1") + half_spread * (i + 1))
                 ask_price = ask_price.quantize(Decimal("0.1"), ROUND_DOWN)
                 if ask_price > best_bid:
@@ -116,8 +166,9 @@ class MarketMakingStrategy(BaseStrategy):
                         self._active_asks.append(oid)
 
         spread_bps = float(best_ask - best_bid) / float(mid) * 10000
+        cm = " CLOSE" if self._close_mode_active else ""
         logger.debug(f"📊 Mid={mid:.1f}  Spread={spread_bps:.1f}bps  "
-                     f"OurSpread={spread_pct:.3f}%  "
+                     f"OurSpread={effective_spread:.3f}%{cm}  "
                      f"Long=${self._long_exposure:.0f}  Short=${self._short_exposure:.0f}  "
                      f"Vol={self._last_volatility:.3f}%")
 
@@ -146,9 +197,10 @@ class MarketMakingStrategy(BaseStrategy):
             self._short_exposure = 0.0
             for p in positions:
                 size = float(p.get("size", p.get("quantity", 0)))
+                mark = float(p.get("markPrice", 0))
                 if size > 0:
-                    self._long_exposure += abs(size) * float(p.get("markPrice", 0))
+                    self._long_exposure += abs(size) * mark
                 elif size < 0:
-                    self._short_exposure += abs(size) * float(p.get("markPrice", 0))
+                    self._short_exposure += abs(size) * mark
         except Exception:
             pass

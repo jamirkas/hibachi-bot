@@ -2,10 +2,10 @@
 Hibachi Trading Bot — Entry Point with Dashboard.
 
 Quick start:
-    python setup.py            # Interactive config wizard
+    python setup.py            # Interactive config wizard → .env + config.yaml
     python main.py             # Run bot + dashboard (if enabled)
 
-Dashboard: http://localhost:8080 (when enabled)
+Dashboard: http://localhost:8080 (when enabled, token in DASHBOARD_TOKEN)
 """
 
 import argparse
@@ -15,6 +15,9 @@ import os
 import sys
 import json
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from hibachi_bot import HibachiExchange, BotConfig
 from hibachi_bot.strategies.grid import GridStrategy
@@ -49,6 +52,7 @@ def parse_args():
     p.add_argument("--config", default="config.yaml", help="Config file path")
     p.add_argument("--strategy", default="", help="Override: grid, mm, or grid,mm")
     p.add_argument("--dashboard", type=int, default=0, help="Override dashboard port (0=use config)")
+    p.add_argument("--dashboard-host", default="", help="Override dashboard bind address")
     p.add_argument("--dry-run", action="store_true", help="Show config, don't trade")
     return p.parse_args()
 
@@ -57,7 +61,7 @@ def parse_args():
 
 BANNER = """
 ╔═══════════════════════════════════╗
-║   🥩  HIBACHI TRADING BOT v2     ║
+║   🥩  HIBACHI TRADING BOT v3     ║
 ║   Grid + Market Maker            ║
 ║   0% maker fees = pure spread    ║
 ╚═══════════════════════════════════╝
@@ -121,10 +125,12 @@ async def main():
     )
 
     # ── Dashboard ──
+    dashboard_host = args.dashboard_host or config.display.web_host
     dashboard_port = args.dashboard or config.display.web_port
+
     if config.display.web_dashboard or args.dashboard:
-        create_dashboard(state, dashboard_port)
-        print(f"📊 Dashboard: http://localhost:{dashboard_port}")
+        create_dashboard(state, dashboard_port, dashboard_host)
+        print(f"📊 Dashboard: http://{dashboard_host}:{dashboard_port}")
 
     # ── Connect ──
     exchange = HibachiExchange(
@@ -139,6 +145,17 @@ async def main():
     except Exception as e:
         logger.error(f"❌ Connection failed: {e}")
         sys.exit(1)
+
+    # ── Oracle (optional Binance WS) ──
+    oracle_task = None
+    if os.getenv("BINANCE_ORACLE_ENABLED", "0") == "1":
+        try:
+            from hibachi_bot.oracle import BinanceOracle
+            oracle = BinanceOracle()
+            oracle_task = asyncio.create_task(oracle.run(state))
+            logger.info("🔮 Binance oracle enabled")
+        except ImportError:
+            logger.warning("⚠️  websockets not installed — oracle disabled")
 
     # ── Strategies ──
     strategy_names = [s.strip() for s in args.strategy.split(",")] if args.strategy else config.active_strategies
@@ -159,8 +176,11 @@ async def main():
         elif name == "mm" and "mm" in config.active_strategies:
             strategy = MarketMakingStrategy(exchange, config.mm, config.risk)
             state.symbol = config.mm.symbol
+            close_mode = "ON" if config.mm.close_mode_enabled else "OFF"
             logger.info(f"📊 MM: spread={config.mm.spread_pct}%, "
-                         f"order=${config.mm.order_size_usdt}")
+                         f"order=${config.mm.order_size_usdt}, "
+                         f"closeMode={close_mode} "
+                         f"(threshold=${config.mm.close_mode_threshold_usd})")
             tasks.append(strategy.run_loop())
 
         else:
@@ -173,6 +193,8 @@ async def main():
     # State sync alongside strategies
     symbol = state.symbol
     tasks.append(state_sync(state, exchange, symbol))
+    if oracle_task:
+        tasks.append(oracle_task)
 
     print("─" * 40)
     print("🤖 Bot running. Press Ctrl+C to stop.")

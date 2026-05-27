@@ -1,89 +1,116 @@
 # 🥩 Hibachi Trading Bot
 
-Grid trading + market making bot for [Hibachi](https://hibachi.xyz) — privacy-first perpetual futures exchange.
+Grid trading + Market Making bot for [Hibachi](https://hibachi.xyz) — a privacy-first perpetuals DEX with **0% maker fees**.
 
-## Why Hibachi?
+Every round-trip bid/ask is pure spread profit. No taker fees on maker orders.
 
-| Feature | Value |
-|---|---|
-| **Maker fee** | 0% on ALL tiers |
-| Taker fee | 0.020% – 0.045% |
-| Settlement | USDT (Arbitrum) |
-| Markets | BTC, ETH, SOL perpetuals |
+## Features
 
-With 0% maker fees, every bid/ask round-trip is pure spread profit.
+- **Grid Strategy** — ladder of buy/sell limit orders around mid-price
+- **Market Making** — bid/ask spread capture with adaptive width
+- **Close Mode** — auto-reduce exposure when position exceeds threshold (inspired by [zo-market-maker-ts](https://github.com/yat1ma30/zo-market-maker-ts))
+- **Binance Oracle** — optional Binance WebSocket fair price (avoids manipulated order books)
+- **Web Dashboard** — real-time PnL chart, positions, orders, event log
+- **Docker** — one-command deploy with docker-compose
+- **Setup Wizard** — interactive config for non-technical users
+- **Risk Management** — TP/SL, max exposure, cancel on sharp moves
 
 ## Quick Start
 
 ```bash
-# 1. Clone
-git clone https://github.com/jamirkas/hibachi-bot
-cd hibachi-bot
-
-# 2. Install
+# 1. Install deps
 pip install -r requirements.txt
 
-# 3. Setup (interactive wizard)
+# 2. Run setup wizard (creates .env + config.yaml)
 python setup.py
 
-# 4. Run
-python main.py
+# 3. Run bot
+python main.py                    # Grid strategy (default)
+python main.py --strategy mm      # Market maker only
+python main.py --strategy grid,mm # Both
 ```
 
-The wizard will ask for:
-- Your Hibachi **API Key** & **Secret Key** (from Settings → API Keys)
-- Your **Account ID** (shown on the API Keys page)
-- Grid/MM parameters (or use defaults)
+Dashboard: `http://localhost:8080` (when enabled in config)
+
+## Docker
+
+```bash
+# Run grid + mm in separate containers
+docker compose up -d
+
+# Or combined in one container
+docker compose --profile combined up -d
+```
+
+## Configuration
+
+| File | Purpose |
+|------|---------|
+| `.env` | API keys (HIBACHI_API_KEY, HIBACHI_SECRET_KEY, HIBACHI_ACCOUNT_ID) |
+| `config.yaml` | Trading parameters (strategy, spread, risk, etc.) |
+
+**Security:** API keys go in `.env` — never in `config.yaml`. `.env` is gitignored.
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HIBACHI_API_KEY` | ✅ | — | API key from Hibachi Settings |
+| `HIBACHI_SECRET_KEY` | ✅ | — | Secret key from Hibachi Settings |
+| `HIBACHI_ACCOUNT_ID` | ✅ | — | Account ID from Hibachi Settings |
+| `DASHBOARD_PORT` | ❌ | `8080` | Web dashboard port |
+| `DASHBOARD_TOKEN` | ❌ | — | Dashboard auth token (empty = no auth) |
+| `DASHBOARD_HOST` | ❌ | `127.0.0.1` | Dashboard bind address |
+| `BINANCE_ORACLE_ENABLED` | ❌ | `0` | Set to `1` for Binance fair price |
 
 ## Strategies
 
 ### Grid Trading
-Places buy/sell ladders around current price. Profits from sideways movement.
+Places N buy levels below mid-price and N sell levels above. Fills are tracked for TP/SL. All levels filled → grid resets.
 
 ```
-Price  ↑
-105,000 |    SELL   SELL   SELL   SELL   SELL
-102,500 |    
-100,000 |━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  mid
- 97,500 |    
- 95,000 |    BUY    BUY    BUY    BUY    BUY
+        SELL @ mid + 3*step
+        SELL @ mid + 2*step
+        SELL @ mid + 1*step
+ ─────── MID ───────
+        BUY  @ mid - 1*step
+        BUY  @ mid - 2*step
+        BUY  @ mid - 3*step
 ```
-
-| Setting | Default | Description |
-|---|---|---|
-| `grid_count` | 10 | Levels per side (20 total) |
-| `step_pct` | 0.15% | Distance between levels |
-| `order_size_usdt` | $50 | USDT per order |
-| `take_profit_pct` | 0.3% | Close at profit |
-| `stop_loss_pct` | 2.0% | Close at loss |
 
 ### Market Making
-Maintains bid/ask orders around mid-price. Adapts spread to volatility.
+Maintains bid/ask orders around mid-price. Spread auto-adjusts to volatility. Position limits prevent runaway exposure.
 
-| Setting | Default | Description |
-|---|---|---|
-| `spread_pct` | 0.05% | Bid/Ask distance from mid |
-| `order_size_usdt` | $100 | USDT per order |
-| `max_orders_per_side` | 3 | Bid/ask levels |
-| `max_long_usdt` | $500 | Long exposure cap |
+**Close Mode:** When long > `close_mode_threshold_usd`, stops buying — only sells to reduce. Vice versa for short. Tightens spread for faster unwind.
 
-## Commands
+## Project Structure
 
-```bash
-python setup.py                  # Interactive config
-python main.py                   # Run all enabled strategies
-python main.py --strategy grid   # Grid only
-python main.py --strategy mm     # MM only
-python main.py --dry-run         # Validate config, don't trade
+```
+hibachi_bot/
+├── auth.py              # HMAC-SHA256 signing
+├── exchange.py          # REST API wrapper
+├── config.py            # Config loader + validation
+├── dashboard.py         # FastAPI web dashboard
+├── oracle.py            # Binance WebSocket fair price
+├── risk.py              # Risk utilities
+└── strategies/
+    ├── base.py          # Abstract base
+    ├── grid.py          # Grid trading
+    └── mm.py            # Market making
+main.py                  # Entry point
+setup.py                 # Interactive wizard
 ```
 
-## Safety
+## Security Review
 
-- `max_total_exposure` — global USDT limit
-- `max_position_per_side` — per-direction cap
-- `stop_loss_pct` — auto-close at loss threshold
-- `cancel_on_price_move_pct` — pause MM on sharp moves
+- ✅ Secrets in `.env` (gitignored, never committed)
+- ✅ Dashboard binds to `127.0.0.1` by default
+- ✅ Optional dashboard token auth (`DASHBOARD_TOKEN`)
+- ✅ `.env` permissions set to 600 by setup wizard
+- ✅ Dependencies pinned to exact versions
+- ✅ HMAC-SHA256 signing with timestamp + body hash
 
-## License
+## Acknowledgements
 
-MIT
+- Review and improvements inspired by [zo-market-maker-ts](https://github.com/yat1ma30/zo-market-maker-ts) (127 ⭐)
+- Security audit by Grok (xAI)

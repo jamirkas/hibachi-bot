@@ -6,8 +6,6 @@ import logging
 from abc import ABC, abstractmethod
 
 from ..exchange import HibachiExchange
-from ..config import StrategyConfig
-from ..risk import RiskConfig
 
 logger = logging.getLogger("hibachi.strategy")
 
@@ -15,7 +13,7 @@ logger = logging.getLogger("hibachi.strategy")
 class BaseStrategy(ABC):
     """Abstract base for all trading strategies."""
 
-    def __init__(self, exchange: HibachiExchange, config: StrategyConfig, risk: RiskConfig):
+    def __init__(self, exchange: HibachiExchange, config, risk):
         self.exchange = exchange
         self.config = config
         self.risk = risk
