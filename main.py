@@ -29,20 +29,59 @@ from hibachi_bot.dashboard import BotState, create_dashboard
 LOG_FORMAT = "%(asctime)s  %(levelname)-7s  %(message)s"
 LOG_DATE = "%H:%M:%S"
 
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE)
-logger = logging.getLogger("hibachi")
+# Try loguru for structured logging, fall back to stdlib
+try:
+    from loguru import logger as loguru_logger
+    import logging as _logging
+
+    class _LoguruIntercept(_logging.Handler):
+        def emit(self, record):
+            try:
+                level = loguru_logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+            loguru_logger.opt(depth=6, exception=record.exc_info).log(
+                level, record.getMessage()
+            )
+
+    _logging.basicConfig(level=_logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE)
+    _logging.getLogger().handlers = [_LoguruIntercept()]
+    _logging.getLogger().setLevel(_logging.INFO)
+
+    loguru_logger.add(
+        "hibachi-bot.log",
+        format="{time:HH:mm:ss} | {level:<7} | {message}",
+        level="DEBUG",
+        rotation="10 MB",
+        retention="7 days",
+    )
+    loguru_logger.add(
+        "hibachi-bot.jsonl",
+        format="{time} | {level} | {message}",
+        level="INFO",
+        rotation="10 MB",
+        retention="30 days",
+        serialize=True,  # JSON lines
+    )
+    logger = _logging.getLogger("hibachi")
+    _LOGGING_SETUP = True
+except ImportError:
+    _logging.basicConfig(level=_logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE)
+    logger = _logging.getLogger("hibachi")
+    _LOGGING_SETUP = False
 
 file_handler = None
 
 
 def setup_file_logging():
-    global file_handler
-    path = Path("hibachi-bot.log")
-    file_handler = logging.FileHandler(path)
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE))
-    file_handler.setLevel(logging.DEBUG)
-    logging.getLogger().addHandler(file_handler)
-    logger.info(f"Logging to {path.absolute()}")
+    """File logging is handled by loguru (if installed) or stdlib fallback."""
+    if not _LOGGING_SETUP:
+        path = Path("hibachi-bot.log")
+        file_handler = logging.FileHandler(path)
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE))
+        file_handler.setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(file_handler)
+        logger.info(f"Logging to {path.absolute()}")
 
 
 # ── CLI ──────────────────────────────────────────────
@@ -151,9 +190,9 @@ async def main():
     if os.getenv("BINANCE_ORACLE_ENABLED", "0") == "1":
         try:
             from hibachi_bot.oracle import BinanceOracle
-            oracle = BinanceOracle()
+            oracle = BinanceOracle(exchange=exchange)
             oracle_task = asyncio.create_task(oracle.run(state))
-            logger.info("🔮 Binance oracle enabled")
+            logger.info("🔮 Binance oracle enabled (with Hibachi fallback)")
         except ImportError:
             logger.warning("⚠️  websockets not installed — oracle disabled")
 
