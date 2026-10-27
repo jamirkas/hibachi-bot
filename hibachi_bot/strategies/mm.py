@@ -1,24 +1,16 @@
 """
-Market making strategy with adaptive spread and multi-level Close Mode.
+Market making strategy with accumulate-then-reduce logic.
 
-Features:
-- Configurable spread width, order count, size
-- Position limits (long/short exposure caps)
-- Auto-cancel on sharp price moves
-- Adaptive spread: widen when volatile, tighten when calm
-- Multi-level Close Mode (from zo-market-maker-ts):
-  🟡 YELLOW (exposure > 50% threshold): reduce order size by half
-  🟠 RED (exposure > 100% threshold): only reducing side, tight spread
-  🔴 CRITICAL (exposure > 200% threshold): pause MM, market-close-only
-
-Inspired by: https://github.com/yat1ma30/zo-market-maker-ts
+- Accumulates up to $700 notional
+- After limit: only reducing orders in profit (vs entry)
+- Stop-loss at -$6 unrealized → aggressive close + 10min pause
+- Order refresh ~every 40s
 """
 
 import asyncio
 import logging
 import time
 from decimal import Decimal, ROUND_DOWN
-from enum import Enum
 from typing import Optional
 
 from .base import BaseStrategy
@@ -28,213 +20,130 @@ from ..config import MMConfig, RiskConfig
 logger = logging.getLogger("hibachi.strategy.mm")
 
 
-class CloseLevel(Enum):
-    """Close Mode severity levels."""
-    NORMAL = "normal"       # Full MM both sides
-    YELLOW = "yellow"       # Reduce order size 50%
-    RED = "red"             # Only reducing side, tight spread
-    CRITICAL = "critical"   # Pause MM, only market-close
-
-
 class MarketMakingStrategy(BaseStrategy):
-    """
-    Market maker — maintains bid/ask orders around mid-price.
-
-    With Hibachi's 0% maker fee, every round-trip is pure spread profit.
-
-    Close Mode Levels:
-      🟡 YELLOW  (exposure > 50% threshold): half-size orders
-      🟠 RED     (exposure > 100% threshold): reducing side only
-      🔴 CRITICAL (exposure > 200% threshold): pause all, close-only
-    """
-
     def __init__(self, exchange: HibachiExchange, config: MMConfig, risk: RiskConfig):
         super().__init__(exchange, config, risk)
         self._cfg = config
-        self._active_bids: list[int] = []
-        self._active_asks: list[int] = []
+        self._active_bids: list = []
+        self._active_asks: list = []
         self._last_mid: Optional[Decimal] = None
         self._long_exposure: float = 0.0
         self._short_exposure: float = 0.0
-        self._pnl_total: float = 0.0
-        self._last_volatility: float = 0.0
-        self._close_level: CloseLevel = CloseLevel.NORMAL
-        self._close_notified: set[CloseLevel] = set()
+        self._last_refresh_ts: float = 0.0
 
     async def setup(self) -> None:
         symbol = self._cfg.symbol
-        cm = "ON" if self._cfg.close_mode_enabled else "OFF"
         logger.info(
-            f"📊 MM: spread={self._cfg.spread_pct}%, "
+            f"MM: spread={self._cfg.spread_pct}%, "
             f"order=${self._cfg.order_size_usdt}, "
-            f"maxLong=${self._cfg.max_long_usdt}, maxShort=${self._cfg.max_short_usdt}, "
-            f"closeMode={cm} (threshold=${self._cfg.close_mode_threshold_usd})"
+            f"maxLong=${self._cfg.max_long_usdt}, maxShort=${self._cfg.max_short_usdt}"
         )
-
-        self.exchange.cancel_all_orders(symbol)
+        try:
+            self.exchange.cancel_all_orders(symbol)
+        except Exception as e:
+            logger.warning(f"setup cancel_all: {e}")
         self._update_exposure()
-
-    def _determine_close_level(self) -> CloseLevel:
-        """Determine Close Mode level based on current exposure."""
-        if not self._cfg.close_mode_enabled:
-            return CloseLevel.NORMAL
-
-        threshold = self._cfg.close_mode_threshold_usd
-        max_exposure = max(self._long_exposure, self._short_exposure)
-
-        if max_exposure > threshold * 2:
-            return CloseLevel.CRITICAL
-        elif max_exposure > threshold:
-            return CloseLevel.RED
-        elif max_exposure > threshold * 0.5:
-            return CloseLevel.YELLOW
-        return CloseLevel.NORMAL
 
     async def tick(self) -> None:
         symbol = self._cfg.symbol
+        now = time.time()
 
-        # Cancel all current orders
-        for oid in self._active_bids + self._active_asks:
-            try:
-                self.exchange.cancel_order(oid)
-            except Exception:
-                pass
-        self._active_bids.clear()
-        self._active_asks.clear()
-
-        # Get fresh book
         book = self.exchange.order_book(symbol, depth=5)
         if not book.bids or not book.asks:
-            await asyncio.sleep(self._cfg.refresh_sec)
+            await asyncio.sleep(2)
             return
 
         best_bid = Decimal(str(book.bids[0][0]))
         best_ask = Decimal(str(book.asks[0][0]))
         mid = (best_bid + best_ask) / Decimal("2")
 
-        # Adaptive spread: widen if price is moving fast
-        spread_pct = self._cfg.spread_pct
-        if self._cfg.adaptive_spread and self._last_mid:
-            price_move_pct = abs(float((mid - self._last_mid) / self._last_mid * 100))
-            self._last_volatility = price_move_pct
-            if price_move_pct > 0.1:
-                spread_pct = min(
-                    spread_pct * (1 + price_move_pct * 10),
-                    self._cfg.max_spread_pct,
-                )
-            spread_pct = max(spread_pct, self._cfg.min_spread_pct)
-
-        self._last_mid = mid
-
-        # Cancel all if price moved too fast
-        if (
-            self._cfg.cancel_on_price_move_pct
-            and self._last_volatility > self._cfg.cancel_on_price_move_pct
-        ):
-            logger.warning(
-                f"⚠️ Price moved {self._last_volatility:.2f}% — pausing MM"
-            )
-            await asyncio.sleep(self._cfg.refresh_sec * 2)
+        should_refresh = (now - self._last_refresh_ts > 40) or (not self._active_bids and not self._active_asks)
+        if not should_refresh:
+            await asyncio.sleep(5)
             return
 
-        # Update exposure from positions
+        try:
+            self.exchange.cancel_all_orders(symbol)
+        except Exception as e:
+            logger.warning(f"cancel_all: {e}")
+        await asyncio.sleep(1.0)
+
+        self._active_bids.clear()
+        self._active_asks.clear()
+        self._last_refresh_ts = now
         self._update_exposure()
 
-        # ── Close Mode: determine level ──
-        level = self._determine_close_level()
+        entry = None
+        pos_size = 0.0
+        unrealized = 0.0
+        try:
+            for p in self.exchange.positions():
+                sz = float(p.get("size", p.get("quantity", 0)))
+                if abs(sz) > 0.00001:
+                    pos_size = sz
+                    entry = Decimal(str(p.get("entryPrice", p.get("avgEntryPrice", mid))))
+                    unrealized = float(p.get("unrealizedPnl", p.get("pnl", 0)))
+                    break
+        except Exception:
+            pass
 
-        # Log transitions
-        if level != self._close_level:
-            prev = self._close_level
-            self._close_level = level
-            if level != CloseLevel.NORMAL:
-                icon = {"YELLOW": "🟡", "RED": "🟠", "CRITICAL": "🔴"}[level.name]
-                logger.warning(
-                    f"{icon} Close Mode: {prev.name} → {level.name} "
-                    f"(Long=${self._long_exposure:.0f}, Short=${self._short_exposure:.0f}, "
-                    f"Threshold=${self._cfg.close_mode_threshold_usd:.0f})"
-                )
-            else:
-                logger.info(
-                    f"🟢 Close Mode: {prev.name} → NORMAL — full MM resumed"
-                )
+        current_exposure = abs(pos_size) * float(mid)
+        STOP_LOSS_USD = 6.0
 
-        # ── Apply Close Mode ──
-        if level == CloseLevel.CRITICAL:
-            # Pause MM entirely — don't place any new orders
-            logger.error(
-                f"🔴 CRITICAL: Exposure critical (Long=${self._long_exposure:.0f}, "
-                f"Short=${self._short_exposure:.0f}) — pausing MM"
-            )
-            await asyncio.sleep(self._cfg.refresh_sec * 3)
+        if unrealized < -STOP_LOSS_USD and abs(pos_size) > 0.00001:
+            logger.warning(f"STOP LOSS: PnL=${unrealized:.2f}, closing")
+            close_side = "ASK" if pos_size > 0 else "BID"
+            close_qty = Decimal(str(abs(pos_size))).quantize(Decimal("0.0001"), ROUND_DOWN)
+            close_price = best_bid if pos_size > 0 else best_ask
+            self._place(close_side, close_price, close_qty, symbol)
+            self._last_refresh_ts = now + 600
+            await asyncio.sleep(10)
             return
+
+        qty = (Decimal(str(self._cfg.order_size_usdt)) / mid).quantize(Decimal("0.0001"), ROUND_DOWN)
+        offsets = [Decimal("0.00035"), Decimal("0.00055"), Decimal("0.00075"), Decimal("0.00095"), Decimal("0.00115")]
+
+        ACCUMULATE_LIMIT = 700.0
 
         place_bids = True
         place_asks = True
-        effective_spread = spread_pct
-        size_multiplier = 1.0
+        min_profit = Decimal("0.0008")
 
-        if level == CloseLevel.YELLOW:
-            # Half-size orders to slow down exposure buildup
-            size_multiplier = 0.5
-            # Slightly wider spread to reduce fill rate
-            effective_spread = max(spread_pct * 1.2, self._cfg.max_spread_pct)
-
-        elif level == CloseLevel.RED:
-            # Only the reducing side
-            if self._long_exposure > self._short_exposure:
-                place_bids = False  # Don't buy more
+        if current_exposure >= ACCUMULATE_LIMIT and entry:
+            if pos_size > 0:
+                place_bids = False
+                logger.info(f"LONG full ({current_exposure:.0f}$), reduce only, entry={entry:.1f}")
             else:
-                place_asks = False  # Don't sell more
-            effective_spread = self._cfg.close_mode_tight_spread
-            # Normal size — we want to unwind fast
+                place_asks = False
+                logger.info(f"SHORT full ({current_exposure:.0f}$), reduce only, entry={entry:.1f}")
 
-        # Place bid/ask ladder
-        qty = Decimal(str(self._cfg.order_size_usdt)) / mid
-        qty = (qty * Decimal(str(size_multiplier))).quantize(
-            Decimal("0.0001"), ROUND_DOWN
-        )
-
-        half_spread = Decimal(str(effective_spread)) / Decimal("200")
-
-        for i in range(self._cfg.max_orders_per_side):
-            # Bids (buy) below mid
+        for off in offsets:
             if place_bids and self._long_exposure < self._cfg.max_long_usdt:
-                bid_price = mid * (Decimal("1") - half_spread * (i + 1))
-                bid_price = bid_price.quantize(Decimal("0.1"), ROUND_DOWN)
-                if bid_price < best_ask:
-                    oid = self._place("BUY", bid_price, qty, symbol)
+                bp = (mid * (Decimal("1") - off)).quantize(Decimal("0.1"), ROUND_DOWN)
+                if entry and pos_size < 0 and current_exposure >= ACCUMULATE_LIMIT:
+                    max_buy = (entry * (Decimal("1") - min_profit)).quantize(Decimal("0.1"), ROUND_DOWN)
+                    if bp > max_buy:
+                        bp = max_buy
+                if bp < best_ask:
+                    oid = self._place("BID", bp, qty, symbol)
                     if oid:
                         self._active_bids.append(oid)
 
-            # Asks (sell) above mid
             if place_asks and self._short_exposure < self._cfg.max_short_usdt:
-                ask_price = mid * (Decimal("1") + half_spread * (i + 1))
-                ask_price = ask_price.quantize(Decimal("0.1"), ROUND_DOWN)
-                if ask_price > best_bid:
-                    oid = self._place("SELL", ask_price, qty, symbol)
+                ap = (mid * (Decimal("1") + off)).quantize(Decimal("0.1"), ROUND_DOWN)
+                if entry and pos_size > 0 and current_exposure >= ACCUMULATE_LIMIT:
+                    min_sell = (entry * (Decimal("1") + min_profit)).quantize(Decimal("0.1"), ROUND_DOWN)
+                    if ap < min_sell:
+                        ap = min_sell
+                if ap > best_bid:
+                    oid = self._place("ASK", ap, qty, symbol)
                     if oid:
                         self._active_asks.append(oid)
 
-        spread_bps = float(best_ask - best_bid) / float(mid) * 10000
-        level_tag = {
-            CloseLevel.NORMAL: "",
-            CloseLevel.YELLOW: " 🟡YELLOW",
-            CloseLevel.RED: " 🟠RED",
-        }.get(level, "")
-        logger.debug(
-            f"📊 Mid={mid:.1f}  Spread={spread_bps:.1f}bps  "
-            f"OurSpread={effective_spread:.3f}%{level_tag}  "
-            f"Size={size_multiplier:.0%}  "
-            f"Long=${self._long_exposure:.0f}  Short=${self._short_exposure:.0f}  "
-            f"Vol={self._last_volatility:.3f}%"
-        )
+        logger.info(f"Refresh mid={mid:.1f} pos={pos_size:.4f} exp=${current_exposure:.0f} L=${self._long_exposure:.0f} S=${self._short_exposure:.0f}")
+        await asyncio.sleep(6)
 
-        await asyncio.sleep(self._cfg.refresh_sec)
-
-    def _place(
-        self, side: str, price: Decimal, qty: Decimal, symbol: str
-    ) -> int | None:
+    def _place(self, side: str, price: Decimal, qty: Decimal, symbol: str):
         try:
             resp = self.exchange.place_order(
                 symbol=symbol,
@@ -250,7 +159,6 @@ class MarketMakingStrategy(BaseStrategy):
             return None
 
     def _update_exposure(self) -> None:
-        """Read current positions to track exposure."""
         try:
             positions = self.exchange.positions()
             self._long_exposure = 0.0
