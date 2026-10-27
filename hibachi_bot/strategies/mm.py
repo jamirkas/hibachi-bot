@@ -1,9 +1,9 @@
 """
 Market making strategy with accumulate-then-reduce logic.
 
-- Accumulates up to $700 notional
+- Accumulates up to configured notional limit
 - After limit: only reducing orders in profit (vs entry)
-- Stop-loss at -$6 unrealized → aggressive close + 10min pause
+- Stop-loss on unrealized → aggressive close + pause
 - Order refresh ~every 40s
 """
 
@@ -88,7 +88,7 @@ class MarketMakingStrategy(BaseStrategy):
             pass
 
         current_exposure = abs(pos_size) * float(mid)
-        STOP_LOSS_USD = 6.0
+        STOP_LOSS_USD = 25.0
 
         if unrealized < -STOP_LOSS_USD and abs(pos_size) > 0.00001:
             logger.warning(f"STOP LOSS: PnL=${unrealized:.2f}, closing")
@@ -103,7 +103,7 @@ class MarketMakingStrategy(BaseStrategy):
         qty = (Decimal(str(self._cfg.order_size_usdt)) / mid).quantize(Decimal("0.0001"), ROUND_DOWN)
         offsets = [Decimal("0.00035"), Decimal("0.00055"), Decimal("0.00075"), Decimal("0.00095"), Decimal("0.00115")]
 
-        ACCUMULATE_LIMIT = 700.0
+        ACCUMULATE_LIMIT = 2000.0
 
         place_bids = True
         place_asks = True
