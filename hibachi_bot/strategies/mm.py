@@ -3,8 +3,8 @@ Market making strategy with accumulate-then-reduce logic.
 
 - Accumulates up to configured notional limit
 - After limit: only reducing orders in profit (vs entry)
+- Position age close: force close if position lives too long
 - Stop-loss on unrealized → aggressive close + pause
-- Order refresh ~every 40s
 """
 
 import asyncio
@@ -30,6 +30,7 @@ class MarketMakingStrategy(BaseStrategy):
         self._long_exposure: float = 0.0
         self._short_exposure: float = 0.0
         self._last_refresh_ts: float = 0.0
+        self._position_start_ts: float = 0.0
 
     async def setup(self) -> None:
         symbol = self._cfg.symbol
@@ -57,7 +58,7 @@ class MarketMakingStrategy(BaseStrategy):
         best_ask = Decimal(str(book.asks[0][0]))
         mid = (best_bid + best_ask) / Decimal("2")
 
-        should_refresh = (now - self._last_refresh_ts > 40) or (not self._active_bids and not self._active_asks)
+        should_refresh = (now - self._last_refresh_ts > 45) or (not self._active_bids and not self._active_asks)
         if not should_refresh:
             await asyncio.sleep(5)
             return
@@ -66,7 +67,7 @@ class MarketMakingStrategy(BaseStrategy):
             self.exchange.cancel_all_orders(symbol)
         except Exception as e:
             logger.warning(f"cancel_all: {e}")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.8)
 
         self._active_bids.clear()
         self._active_asks.clear()
@@ -87,61 +88,81 @@ class MarketMakingStrategy(BaseStrategy):
         except Exception:
             pass
 
-        current_exposure = abs(pos_size) * float(mid)
-        STOP_LOSS_USD = 25.0
+        # Track position age
+        if abs(pos_size) > 0.00001:
+            if self._position_start_ts == 0.0:
+                self._position_start_ts = now
+        else:
+            self._position_start_ts = 0.0
 
+        current_exposure = abs(pos_size) * float(mid)
+        STOP_LOSS_USD = 50.0
+        MAX_POSITION_AGE = 2700  # 45 minutes
+        ACCUMULATE_LIMIT = 5000.0
+
+        # Force close by position age
+        if entry and abs(pos_size) > 0.00001 and (now - self._position_start_ts) > MAX_POSITION_AGE:
+            logger.warning(f"POSITION AGE CLOSE: age={(now - self._position_start_ts)/60:.0f}min exp=${current_exposure:.0f}")
+            close_side = "ASK" if pos_size > 0 else "BID"
+            close_qty = Decimal(str(abs(pos_size))).quantize(Decimal("0.0001"), ROUND_DOWN)
+            close_price = best_bid if pos_size > 0 else best_ask
+            self._place(close_side, close_price, close_qty, symbol)
+            self._position_start_ts = 0.0
+            self._last_refresh_ts = now + 30
+            await asyncio.sleep(8)
+            return
+
+        # Stop-loss
         if unrealized < -STOP_LOSS_USD and abs(pos_size) > 0.00001:
             logger.warning(f"STOP LOSS: PnL=${unrealized:.2f}, closing")
             close_side = "ASK" if pos_size > 0 else "BID"
             close_qty = Decimal(str(abs(pos_size))).quantize(Decimal("0.0001"), ROUND_DOWN)
             close_price = best_bid if pos_size > 0 else best_ask
             self._place(close_side, close_price, close_qty, symbol)
+            self._position_start_ts = 0.0
             self._last_refresh_ts = now + 600
             await asyncio.sleep(10)
             return
 
         qty = (Decimal(str(self._cfg.order_size_usdt)) / mid).quantize(Decimal("0.0001"), ROUND_DOWN)
-        offsets = [Decimal("0.00035"), Decimal("0.00055"), Decimal("0.00075"), Decimal("0.00095"), Decimal("0.00115")]
-
-        ACCUMULATE_LIMIT = 2000.0
+        offsets = [Decimal("0.0003"), Decimal("0.0005"), Decimal("0.0008")]
+        min_profit = Decimal("0.00035")
 
         place_bids = True
         place_asks = True
-        min_profit = Decimal("0.0008")
 
-        if current_exposure >= ACCUMULATE_LIMIT and entry:
+        if entry and abs(pos_size) > 0.00001 and current_exposure >= ACCUMULATE_LIMIT:
             if pos_size > 0:
                 place_bids = False
-                logger.info(f"LONG full ({current_exposure:.0f}$), reduce only, entry={entry:.1f}")
+                place_asks = True
             else:
                 place_asks = False
-                logger.info(f"SHORT full ({current_exposure:.0f}$), reduce only, entry={entry:.1f}")
+                place_bids = True
+            logger.info(f"LIMIT reached exp=${current_exposure:.0f} — exit only")
 
         for off in offsets:
             if place_bids and self._long_exposure < self._cfg.max_long_usdt:
-                bp = (mid * (Decimal("1") - off)).quantize(Decimal("0.1"), ROUND_DOWN)
-                if entry and pos_size < 0 and current_exposure >= ACCUMULATE_LIMIT:
-                    max_buy = (entry * (Decimal("1") - min_profit)).quantize(Decimal("0.1"), ROUND_DOWN)
-                    if bp > max_buy:
-                        bp = max_buy
-                if bp < best_ask:
+                if entry and pos_size < 0:
+                    bp = (entry * (Decimal("1") - min_profit - off)).quantize(Decimal("0.1"), ROUND_DOWN)
+                else:
+                    bp = (mid * (Decimal("1") - off)).quantize(Decimal("0.1"), ROUND_DOWN)
+                if bp < best_ask and bp > 0:
                     oid = self._place("BID", bp, qty, symbol)
                     if oid:
                         self._active_bids.append(oid)
 
             if place_asks and self._short_exposure < self._cfg.max_short_usdt:
-                ap = (mid * (Decimal("1") + off)).quantize(Decimal("0.1"), ROUND_DOWN)
-                if entry and pos_size > 0 and current_exposure >= ACCUMULATE_LIMIT:
-                    min_sell = (entry * (Decimal("1") + min_profit)).quantize(Decimal("0.1"), ROUND_DOWN)
-                    if ap < min_sell:
-                        ap = min_sell
+                if entry and pos_size > 0:
+                    ap = (entry * (Decimal("1") + min_profit + off)).quantize(Decimal("0.1"), ROUND_DOWN)
+                else:
+                    ap = (mid * (Decimal("1") + off)).quantize(Decimal("0.1"), ROUND_DOWN)
                 if ap > best_bid:
                     oid = self._place("ASK", ap, qty, symbol)
                     if oid:
                         self._active_asks.append(oid)
 
-        logger.info(f"Refresh mid={mid:.1f} pos={pos_size:.4f} exp=${current_exposure:.0f} L=${self._long_exposure:.0f} S=${self._short_exposure:.0f}")
-        await asyncio.sleep(6)
+        logger.info(f"Refresh mid={mid:.1f} pos={pos_size:.4f} exp=${current_exposure:.0f}")
+        await asyncio.sleep(5)
 
     def _place(self, side: str, price: Decimal, qty: Decimal, symbol: str):
         try:
