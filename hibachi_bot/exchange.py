@@ -4,9 +4,11 @@ Hibachi Exchange REST API wrapper with resilience.
 Features:
 - Exponential backoff with jitter on transient failures
 - Circuit breaker: 3 consecutive failures → pause for 30s
-- Specific error handling for 429 (rate limit), 503 (maintenance), 5xx
+- Order signing via eth_account.unsafe_sign_hash
+- Correct orderbook parsing (bid.levels / ask.levels)
 """
 
+import hashlib
 import requests
 import json
 import time
@@ -15,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from eth_account import Account
 from .auth import HibachiAuth
 
 logger = logging.getLogger("hibachi")
@@ -38,40 +41,32 @@ class HibachiExchange:
     REST_URL = "https://api.hibachi.xyz"
     DATA_URL = "https://data-api.hibachi.xyz"
 
-    # Backoff config
     MAX_RETRIES = 3
-    BASE_DELAY = 1.0  # seconds
+    BASE_DELAY = 1.0
     MAX_DELAY = 30.0
 
-    # Circuit breaker config
-    CB_FAILURE_THRESHOLD = 3       # consecutive failures to open
-    CB_TIMEOUT = 30                # seconds to stay open
-    CB_HALF_OPEN_ALLOW = 1         # allow 1 request in half-open state
+    CB_FAILURE_THRESHOLD = 3
+    CB_TIMEOUT = 30
+    CB_HALF_OPEN_ALLOW = 1
 
     def __init__(self, api_key: str, secret_key: str, account_id: int):
         self.auth = HibachiAuth(api_key, secret_key)
         self.account_id = account_id
         self.session = requests.Session()
 
-        # Circuit breaker state
         self._cb_failures: int = 0
         self._cb_last_failure: float = 0.0
         self._cb_open: bool = False
         self._cb_half_open_used: int = 0
 
-    # ── Circuit Breaker ──────────────────────────────
-
     def _cb_check(self):
-        """Check circuit breaker before request. Raises CircuitBreakerOpen if blocked."""
         if not self._cb_open:
             return
-
         elapsed = time.time() - self._cb_last_failure
         if elapsed > self.CB_TIMEOUT:
-            # Transition to half-open
             self._cb_open = False
             self._cb_half_open_used = 0
-            logger.info("🔌 Circuit breaker: half-open — allowing test request")
+            logger.info("Circuit breaker: half-open")
         else:
             remaining = int(self.CB_TIMEOUT - elapsed)
             raise CircuitBreakerOpen(
@@ -80,39 +75,41 @@ class HibachiExchange:
             )
 
     def _cb_success(self):
-        """Report successful request to circuit breaker."""
         if not self._cb_open and self._cb_half_open_used > 0:
-            logger.info("🔌 Circuit breaker: closed — half-open test passed")
+            logger.info("Circuit breaker: closed")
         self._cb_failures = 0
         self._cb_half_open_used = 0
 
     def _cb_failure(self):
-        """Report failed request to circuit breaker."""
         self._cb_failures += 1
         self._cb_last_failure = time.time()
         if self._cb_failures >= self.CB_FAILURE_THRESHOLD and not self._cb_open:
             self._cb_open = True
             logger.error(
-                f"🔌 Circuit breaker: OPEN ({self._cb_failures} consecutive failures, "
+                f"Circuit breaker: OPEN ({self._cb_failures} consecutive failures, "
                 f"blocking for {self.CB_TIMEOUT}s)"
             )
 
-    # ── Retry helpers ────────────────────────────────
-
     def _backoff_delay(self, attempt: int) -> float:
-        """Exponential backoff with jitter."""
         delay = min(self.BASE_DELAY * (2 ** attempt), self.MAX_DELAY)
         jitter = random.uniform(0, delay * 0.5)
         return delay + jitter
 
     def _should_retry(self, response, attempt: int) -> bool:
-        """Decide whether to retry based on status code and attempt count."""
         if attempt >= self.MAX_RETRIES:
             return False
-        # Retry on rate limit, server errors, and connection issues
         return response.status_code in (429, 500, 502, 503, 504)
 
-    # ── Core request ─────────────────────────────────
+    def _sign_payload(self, payload: bytes) -> str:
+        """Sign arbitrary bytes with the account private key."""
+        digest = hashlib.sha256(payload).digest()
+        pk = self.auth.secret_key
+        if isinstance(pk, bytes):
+            pk = pk.decode()
+        if pk.startswith("0x"):
+            pk = pk[2:]
+        signed = Account.unsafe_sign_hash(digest, private_key=bytes.fromhex(pk))
+        return signed.signature.hex()
 
     def _req(
         self,
@@ -121,12 +118,10 @@ class HibachiExchange:
         body: dict | None = None,
         base_url: str | None = None,
     ) -> dict:
-        """Make an authenticated request with retry + circuit breaker."""
         url = f"{base_url or self.REST_URL}{path}"
         retryable_response = None
 
         for attempt in range(self.MAX_RETRIES + 1):
-            # Check circuit breaker
             try:
                 self._cb_check()
             except CircuitBreakerOpen:
@@ -138,52 +133,33 @@ class HibachiExchange:
                     method, url, json=body, headers=headers, timeout=10
                 )
 
-                # Success
                 if resp.status_code < 400:
                     self._cb_success()
                     return resp.json()
 
-                # Rate limited
                 if resp.status_code == 429:
-                    logger.warning(
-                        f"⚠️  Rate limited (429) on {method} {path}, "
-                        f"attempt {attempt + 1}/{self.MAX_RETRIES + 1}"
-                    )
+                    logger.warning(f"Rate limited on {method} {path}")
                     if self._should_retry(resp, attempt):
-                        delay = self._backoff_delay(attempt)
-                        time.sleep(delay)
+                        time.sleep(self._backoff_delay(attempt))
                         retryable_response = resp
                         continue
                     resp.raise_for_status()
 
-                # Server error
                 if resp.status_code >= 500:
-                    logger.warning(
-                        f"⚠️  Server error ({resp.status_code}) on {method} {path}, "
-                        f"attempt {attempt + 1}/{self.MAX_RETRIES + 1}"
-                    )
+                    logger.warning(f"Server error {resp.status_code} on {method} {path}")
                     if self._should_retry(resp, attempt):
-                        delay = self._backoff_delay(attempt)
-                        time.sleep(delay)
+                        time.sleep(self._backoff_delay(attempt))
                         retryable_response = resp
                         continue
                     resp.raise_for_status()
 
-                # Other errors
-                logger.error(
-                    f"❌ HTTP {resp.status_code} on {method} {path}: "
-                    f"{resp.text[:200]}"
-                )
+                logger.error(f"HTTP {resp.status_code} on {method} {path}: {resp.text[:200]}")
                 resp.raise_for_status()
 
             except (requests.ConnectionError, requests.Timeout) as e:
-                logger.warning(
-                    f"⚠️  Connection error on {method} {path}: {e}, "
-                    f"attempt {attempt + 1}/{self.MAX_RETRIES + 1}"
-                )
+                logger.warning(f"Connection error on {method} {path}: {e}")
                 if attempt < self.MAX_RETRIES:
-                    delay = self._backoff_delay(attempt)
-                    time.sleep(delay)
+                    time.sleep(self._backoff_delay(attempt))
                     continue
                 self._cb_failure()
                 raise
@@ -196,20 +172,14 @@ class HibachiExchange:
                 self._cb_failure()
                 raise
 
-        # All retries exhausted
         self._cb_failure()
-        logger.error(f"❌ All {self.MAX_RETRIES + 1} attempts failed for {method} {path}")
+        logger.error(f"All attempts failed for {method} {path}")
         if retryable_response is not None:
             retryable_response.raise_for_status()
         raise RuntimeError(f"Request failed: {method} {path}")
 
     def _get_data(self, path: str) -> dict:
-        """Public data endpoint (no auth, no retry for simplicity)."""
-        return self.session.get(
-            f"{self.DATA_URL}{path}", timeout=10
-        ).json()
-
-    # ── Account ──────────────────────────────────────
+        return self.session.get(f"{self.DATA_URL}{path}", timeout=10).json()
 
     def balance(self) -> dict:
         return self._req("GET", f"/capital/balance?accountId={self.account_id}")
@@ -217,42 +187,67 @@ class HibachiExchange:
     def account_info(self) -> dict:
         return self._req("GET", f"/trade/account/info?accountId={self.account_id}")
 
-    # ── Orders ───────────────────────────────────────
-
     def place_order(
         self,
         symbol: str,
-        side: str,  # "BUY" | "SELL"
-        order_type: str,  # "LIMIT" | "MARKET"
+        side: str,
+        order_type: str,
         quantity: str,
         price: str | None = None,
         time_in_force: str = "GTC",
         reduce_only: bool = False,
     ) -> dict:
+        import struct
+        nonce = int(time.time() * 1000)
+        # Map side
+        side_flag = 1 if side.upper() in ("ASK", "SELL") else 0
+        qty_int = int(float(quantity) * 1e8)
+        price_int = int(float(price) * 1e8) if price else 0
+        max_fees = 5000  # 0.05% in bps-ish, adjust if needed
+
+        payload = struct.pack(">Q I Q I Q Q", nonce, 0, qty_int, side_flag, price_int, max_fees)
+        signature = self._sign_payload(payload)
+
         body = {
             "accountId": self.account_id,
             "symbol": symbol,
-            "side": side.upper(),
+            "side": "ASK" if side.upper() in ("ASK", "SELL") else "BID",
             "type": order_type.upper(),
             "quantity": str(quantity),
             "timeInForce": time_in_force,
             "reduceOnly": reduce_only,
+            "nonce": nonce,
+            "signature": signature,
+            "maxFeesPercent": "0.0005",
         }
         if price is not None:
             body["price"] = str(price)
         return self._req("POST", "/trade/order", body)
 
-    def cancel_order(self, order_id: int) -> dict:
-        return self._req(
-            "DELETE",
-            f"/trade/order?orderId={order_id}&accountId={self.account_id}",
-        )
+    def cancel_order(self, order_id: str) -> dict:
+        oid = int(order_id)
+        payload = oid.to_bytes(8, byteorder="big")
+        signature = self._sign_payload(payload)
+        body = {
+            "accountId": self.account_id,
+            "orderId": order_id,
+            "signature": signature,
+        }
+        return self._req("DELETE", "/trade/order", body)
 
     def cancel_all_orders(self, symbol: str | None = None) -> dict:
-        path = f"/trade/orders?accountId={self.account_id}"
+        import struct
+        nonce = int(time.time() * 1000)
+        payload = struct.pack(">Q", nonce)
+        signature = self._sign_payload(payload)
+        body = {
+            "accountId": self.account_id,
+            "nonce": nonce,
+            "signature": signature,
+        }
         if symbol:
-            path += f"&symbol={symbol}"
-        return self._req("DELETE", path)
+            body["symbol"] = symbol
+        return self._req("DELETE", "/trade/orders", body)
 
     def open_orders(self, symbol: str | None = None) -> list[dict]:
         path = f"/trade/orders?accountId={self.account_id}"
@@ -264,19 +259,19 @@ class HibachiExchange:
         info = self.account_info()
         return info.get("positions", [])
 
-    # ── Market Data ──────────────────────────────────
-
-    def order_book(self, symbol: str, depth: int = 10, granularity: float = 0.01) -> OrderBook:
+    def order_book(self, symbol: str, depth: int = 10, granularity: float = 1) -> OrderBook:
         data = self._get_data(
             f"/market/data/orderbook?symbol={symbol}&depth={depth}&granularity={granularity}"
         )
-        bids = [(float(b["price"]), float(b["size"])) for b in data.get("bids", [])]
-        asks = [(float(a["price"]), float(a["size"])) for a in data.get("asks", [])]
-        return OrderBook(bids=bids, asks=asks, timestamp=data.get("timestamp", 0))
+        bid_levels = data.get("bid", {}).get("levels", [])
+        ask_levels = data.get("ask", {}).get("levels", [])
+        bids = [(float(b["price"]), float(b["quantity"])) for b in bid_levels]
+        asks = [(float(a["price"]), float(a["quantity"])) for a in ask_levels]
+        return OrderBook(bids=bids, asks=asks, timestamp=0)
 
     def ticker_price(self, symbol: str) -> float:
         data = self._get_data(f"/market/data/prices?symbol={symbol}")
-        return float(data.get("price", data.get("lastPrice", 0)))
+        return float(data.get("markPrice", data.get("bidPrice", data.get("price", 0))))
 
     def exchange_info(self) -> dict:
         return self._get_data("/market/exchange-info")
